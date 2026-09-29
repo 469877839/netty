@@ -17,15 +17,22 @@ package io.netty.util;
 
 import org.junit.jupiter.api.Test;
 
+import io.netty.util.concurrent.ImmediateExecutor;
+
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -364,5 +371,155 @@ public class HashedWheelTimerTest {
                 latch.countDown();
             }
         };
+    }
+
+    private static HashedWheelTimer newIsolatedTimer(int maxIsolationThreads) {
+        return new HashedWheelTimer(Executors.defaultThreadFactory(), 100, TimeUnit.MILLISECONDS, 512,
+                true, -1, ImmediateExecutor.INSTANCE, maxIsolationThreads);
+    }
+
+    @Test
+    public void testIsolatedTimerDoesNotLetSlowTaskDelayLaterBatches() throws Exception {
+        final HashedWheelTimer timer = newIsolatedTimer(2);
+        try {
+            final long start = System.nanoTime();
+            final CountDownLatch slowStarted = new CountDownLatch(1);
+            final CountDownLatch fastRan = new CountDownLatch(1);
+            final AtomicLong fastRunAt = new AtomicLong(-1);
+            timer.newTimeout(new TimerTask() {
+                @Override
+                public void run(Timeout timeout) throws Exception {
+                    slowStarted.countDown();
+                    Thread.sleep(500);
+                }
+            }, 100, TimeUnit.MILLISECONDS);
+            timer.newTimeout(new TimerTask() {
+                @Override
+                public void run(Timeout timeout) {
+                    fastRunAt.set(System.nanoTime());
+                    fastRan.countDown();
+                }
+            }, 200, TimeUnit.MILLISECONDS);
+
+            assertTrue(slowStarted.await(3, TimeUnit.SECONDS));
+            assertTrue(fastRan.await(3, TimeUnit.SECONDS));
+            // The 500ms task must not delay the other batch: the fast task has to start within
+            // 250ms after its scheduled deadline.
+            long deviation = TimeUnit.NANOSECONDS.toMillis(fastRunAt.get() - start) - 200;
+            assertTrue(deviation < 250, "deviation too large: " + deviation + "ms");
+        } finally {
+            timer.stop();
+        }
+    }
+
+    @Test
+    public void testIsolatedTimerExecutesSameTickTasksInSubmissionOrder() throws Exception {
+        final HashedWheelTimer timer = newIsolatedTimer(2);
+        try {
+            final int count = 16;
+            final CountDownLatch latch = new CountDownLatch(count);
+            final Queue<Integer> executionOrder = new ConcurrentLinkedQueue<Integer>();
+            for (int i = 0; i < count; i++) {
+                final int index = i;
+                timer.newTimeout(new TimerTask() {
+                    @Override
+                    public void run(Timeout timeout) {
+                        executionOrder.add(index);
+                        latch.countDown();
+                    }
+                }, 500, TimeUnit.MILLISECONDS);
+            }
+            assertTrue(latch.await(5, TimeUnit.SECONDS));
+            for (int i = 0; i < count; i++) {
+                assertEquals(Integer.valueOf(i), executionOrder.poll());
+            }
+        } finally {
+            timer.stop();
+        }
+    }
+
+    @Test
+    public void testIsolatedTimerDoesNotRunTaskCancelledAfterDispatch() throws Exception {
+        final HashedWheelTimer timer = newIsolatedTimer(1);
+        try {
+            final CountDownLatch blockerStarted = new CountDownLatch(1);
+            final CountDownLatch blockerDone = new CountDownLatch(1);
+            final AtomicBoolean ran = new AtomicBoolean();
+            timer.newTimeout(new TimerTask() {
+                @Override
+                public void run(Timeout timeout) throws Exception {
+                    blockerStarted.countDown();
+                    Thread.sleep(500);
+                    blockerDone.countDown();
+                }
+            }, 100, TimeUnit.MILLISECONDS);
+            final Timeout timeout = timer.newTimeout(new TimerTask() {
+                @Override
+                public void run(Timeout timeout) {
+                    ran.set(true);
+                }
+            }, 100, TimeUnit.MILLISECONDS);
+
+            // Wait until the batch was dispatched and the first task occupies the only
+            // isolation thread, so the second task is dispatched but not yet started.
+            assertTrue(blockerStarted.await(3, TimeUnit.SECONDS));
+            assertTrue(timeout.cancel());
+            assertTrue(blockerDone.await(3, TimeUnit.SECONDS));
+            // Give the batch a chance to (incorrectly) run the cancelled task.
+            Thread.sleep(200);
+            assertFalse(ran.get());
+            assertTrue(timeout.isCancelled());
+        } finally {
+            timer.stop();
+        }
+    }
+
+    @Test
+    public void testIsolatedTimerStopIsBoundedAndReturnsOnlyUnstartedTasks() throws Exception {
+        final HashedWheelTimer timer = newIsolatedTimer(1);
+        final AtomicBoolean keepBlocking = new AtomicBoolean(true);
+        final AtomicBoolean dispatchedRan = new AtomicBoolean();
+        try {
+            final CountDownLatch blockerStarted = new CountDownLatch(1);
+            timer.newTimeout(new TimerTask() {
+                @Override
+                public void run(Timeout timeout) {
+                    blockerStarted.countDown();
+                    // Ignore interrupts on purpose to simulate a stuck task.
+                    while (keepBlocking.get()) {
+                        try {
+                            Thread.sleep(50);
+                        } catch (InterruptedException ignored) {
+                            // ignored
+                        }
+                    }
+                }
+            }, 100, TimeUnit.MILLISECONDS);
+            final Timeout dispatched = timer.newTimeout(new TimerTask() {
+                @Override
+                public void run(Timeout timeout) {
+                    dispatchedRan.set(true);
+                }
+            }, 100, TimeUnit.MILLISECONDS);
+            final Timeout pending = timer.newTimeout(createNoOpTimerTask(), 1, TimeUnit.MINUTES);
+
+            assertTrue(blockerStarted.await(3, TimeUnit.SECONDS));
+            // The stuck task does not count as pending anymore, the dispatched but not yet
+            // started task and the future task still do.
+            assertEquals(2, timer.pendingTimeouts());
+
+            final long stopStart = System.nanoTime();
+            final Set<Timeout> unprocessed = timer.stop();
+            final long stopMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - stopStart);
+            assertTrue(stopMillis < 2000, "stop() took too long: " + stopMillis + "ms");
+            assertEquals(2, unprocessed.size());
+            assertTrue(unprocessed.contains(dispatched));
+            assertTrue(unprocessed.contains(pending));
+        } finally {
+            keepBlocking.set(false);
+        }
+        // The cancelled task that was already dispatched must never run, even after stop().
+        Thread.sleep(200);
+        assertFalse(dispatchedRan.get());
     }
 }
