@@ -182,6 +182,52 @@ import io.netty.channel.ChannelHandlerContext;
  * | 0xCA | 0x0010 | 0xFE | "HELLO, WORLD" |      | 0xFE | "HELLO, WORLD" |
  * +------+--------+------+----------------+      +------+----------------+
  * </pre>
+ *
+ * <h3>Magic number validation and resynchronization</h3>
+ *
+ * In addition to the length field, the decoder can validate a magic number in the
+ * frame header before it attempts to decode a frame.  The magic number is configured
+ * with {@code magicNumber}, {@code magicNumberOffset} and {@code magicNumberLength}
+ * (1, 2, 3, 4 or 8 bytes, decoded with the same {@link ByteOrder} as the length field).
+ * When the bytes at the configured offset do not match the magic number, no frame is
+ * produced for that position.
+ * <p>
+ * What happens next depends on whether resynchronization is enabled
+ * ({@code maxResyncScanBytes} &gt; 0):
+ * <ul>
+ *     <li>Resynchronization disabled: a {@link CorruptedFrameException} is thrown
+ *     immediately on the first magic number mismatch.</li>
+ *     <li>Resynchronization enabled: the decoder scans the accumulated bytes forward for
+ *     the next occurrence of the magic number and restarts frame detection there.  The
+ *     bytes skipped while scanning are silently discarded.  To avoid mistaking magic
+ *     number bytes that appear inside a length field or a payload for a frame boundary,
+ *     a candidate position is only accepted when its length field is self-consistent
+ *     (non-negative, adjusted frame length between the header length and
+ *     {@code maxFrameLength}).  If no plausible magic number is found within
+ *     {@code maxResyncScanBytes} bytes, a {@link CorruptedFrameException} is thrown.</li>
+ * </ul>
+ * <p>
+ * Because {@code failFast} and resynchronization cannot both win, the following
+ * deterministic rule applies when a length field looks untrustworthy (negative,
+ * smaller than the header, or larger than {@code maxFrameLength}) at a position where
+ * the magic number matched:
+ * <ul>
+ *     <li>{@code failFast == true}: the legacy behavior is kept and the decoder throws
+ *     immediately ({@link TooLongFrameException} or {@link CorruptedFrameException},
+ *     exactly as without magic number validation).</li>
+ *     <li>{@code failFast == false}: the magic number match is assumed to be a false
+ *     positive and the decoder resynchronizes instead of throwing.</li>
+ * </ul>
+ * A magic number mismatch always triggers resynchronization first, regardless of
+ * {@code failFast}.  If the buffer does not contain enough bytes to validate the magic
+ * number and the length field (e.g. only half a frame has been received), the decoder
+ * waits for more data and neither scans nor fails.
+ * <p>
+ * The scan progress is tracked by consuming the scanned bytes from the cumulative buffer,
+ * so it stays consistent across {@code decode} invocations and across compaction of the
+ * cumulative buffer (see {@link ByteToMessageDecoder#discardSomeReadBytes()}), and no
+ * per-frame copies or unreleased slices are created while scanning.
+ *
  * @see LengthFieldPrepender
  */
 public class LengthFieldBasedFrameDecoder extends ByteToMessageDecoder {
@@ -194,10 +240,18 @@ public class LengthFieldBasedFrameDecoder extends ByteToMessageDecoder {
     private final int lengthAdjustment;
     private final int initialBytesToStrip;
     private final boolean failFast;
+    private final long magicNumber;
+    private final int magicNumberOffset;
+    private final int magicNumberLength;
+    private final int magicNumberEndOffset;
+    private final int maxResyncScanBytes;
+    private final byte magicNumberFirstByte;
     private boolean discardingTooLongFrame;
     private long tooLongFrameLength;
     private long bytesToDiscard;
     private int frameLengthInt = -1;
+    private boolean resyncing;
+    private int resyncScannedBytes;
 
     /**
      * Creates a new instance.
@@ -302,6 +356,102 @@ public class LengthFieldBasedFrameDecoder extends ByteToMessageDecoder {
     public LengthFieldBasedFrameDecoder(
             ByteOrder byteOrder, int maxFrameLength, int lengthFieldOffset, int lengthFieldLength,
             int lengthAdjustment, int initialBytesToStrip, boolean failFast) {
+        this(byteOrder, maxFrameLength, lengthFieldOffset, lengthFieldLength,
+                lengthAdjustment, initialBytesToStrip, failFast, 0, 0, 0, 0);
+    }
+
+    /**
+     * Creates a new instance that validates a magic number in the frame header before
+     * decoding a frame.  A magic number mismatch results in a {@link CorruptedFrameException};
+     * use {@link #LengthFieldBasedFrameDecoder(ByteOrder, int, int, int, int, int, boolean,
+     * long, int, int, int)} to enable resynchronization instead.
+     *
+     * @param byteOrder
+     *        the {@link ByteOrder} of the length field and the magic number
+     * @param maxFrameLength
+     *        the maximum length of the frame.  If the length of the frame is
+     *        greater than this value, {@link TooLongFrameException} will be
+     *        thrown.
+     * @param lengthFieldOffset
+     *        the offset of the length field
+     * @param lengthFieldLength
+     *        the length of the length field
+     * @param lengthAdjustment
+     *        the compensation value to add to the value of the length field
+     * @param initialBytesToStrip
+     *        the number of first bytes to strip out from the decoded frame
+     * @param failFast
+     *        If <tt>true</tt>, a {@link TooLongFrameException} is thrown as
+     *        soon as the decoder notices the length of the frame will exceed
+     *        <tt>maxFrameLength</tt> regardless of whether the entire frame
+     *        has been read.  If <tt>false</tt>, a {@link TooLongFrameException}
+     *        is thrown after the entire frame that exceeds <tt>maxFrameLength</tt>
+     *        has been read.
+     * @param magicNumber
+     *        the magic number that must be present in the frame header, as an
+     *        unsigned value that fits into {@code magicNumberLength} bytes
+     * @param magicNumberOffset
+     *        the offset of the magic number in the frame
+     * @param magicNumberLength
+     *        the length of the magic number: 1, 2, 3, 4, or 8
+     */
+    public LengthFieldBasedFrameDecoder(
+            ByteOrder byteOrder, int maxFrameLength, int lengthFieldOffset, int lengthFieldLength,
+            int lengthAdjustment, int initialBytesToStrip, boolean failFast,
+            long magicNumber, int magicNumberOffset, int magicNumberLength) {
+        this(byteOrder, maxFrameLength, lengthFieldOffset, lengthFieldLength,
+                lengthAdjustment, initialBytesToStrip, failFast,
+                magicNumber, magicNumberOffset, magicNumberLength, 0);
+    }
+
+    /**
+     * Creates a new instance that validates a magic number in the frame header before
+     * decoding a frame and resynchronizes on invalid data.
+     * <p>
+     * When the magic number does not match, or when {@code failFast} is <tt>false</tt>
+     * and the length field at a magic-validated position is not plausible, the decoder
+     * scans forward for the next magic number whose length field is self-consistent and
+     * restarts frame detection there, silently discarding the skipped bytes.  A
+     * {@link CorruptedFrameException} is thrown when no plausible magic number is found
+     * within {@code maxResyncScanBytes} bytes.  See the class javadoc for the exact
+     * rules.
+     *
+     * @param byteOrder
+     *        the {@link ByteOrder} of the length field and the magic number
+     * @param maxFrameLength
+     *        the maximum length of the frame.  If the length of the frame is
+     *        greater than this value, {@link TooLongFrameException} will be
+     *        thrown.
+     * @param lengthFieldOffset
+     *        the offset of the length field
+     * @param lengthFieldLength
+     *        the length of the length field
+     * @param lengthAdjustment
+     *        the compensation value to add to the value of the length field
+     * @param initialBytesToStrip
+     *        the number of first bytes to strip out from the decoded frame
+     * @param failFast
+     *        If <tt>true</tt>, an untrustworthy length field at a magic-validated
+     *        position results in an immediate {@link TooLongFrameException} or
+     *        {@link CorruptedFrameException} instead of resynchronization.
+     *        If <tt>false</tt>, such a position is treated as a false-positive
+     *        magic number match and the decoder resynchronizes.
+     * @param magicNumber
+     *        the magic number that must be present in the frame header, as an
+     *        unsigned value that fits into {@code magicNumberLength} bytes
+     * @param magicNumberOffset
+     *        the offset of the magic number in the frame
+     * @param magicNumberLength
+     *        the length of the magic number: 1, 2, 3, 4, or 8
+     * @param maxResyncScanBytes
+     *        the maximum number of bytes to scan while resynchronizing before
+     *        giving up with a {@link CorruptedFrameException}.  Must be
+     *        {@code > 0} to enable resynchronization.
+     */
+    public LengthFieldBasedFrameDecoder(
+            ByteOrder byteOrder, int maxFrameLength, int lengthFieldOffset, int lengthFieldLength,
+            int lengthAdjustment, int initialBytesToStrip, boolean failFast,
+            long magicNumber, int magicNumberOffset, int magicNumberLength, int maxResyncScanBytes) {
 
         this.byteOrder = checkNotNull(byteOrder, "byteOrder");
 
@@ -319,6 +469,31 @@ public class LengthFieldBasedFrameDecoder extends ByteToMessageDecoder {
                     "lengthFieldLength (" + lengthFieldLength + ").");
         }
 
+        checkPositiveOrZero(magicNumberOffset, "magicNumberOffset");
+
+        checkPositiveOrZero(maxResyncScanBytes, "maxResyncScanBytes");
+
+        if (magicNumberLength != 0 && magicNumberLength != 1 && magicNumberLength != 2 &&
+                magicNumberLength != 3 && magicNumberLength != 4 && magicNumberLength != 8) {
+            throw new IllegalArgumentException(
+                    "magicNumberLength must be 0 (disabled), 1, 2, 3, 4, or 8: " + magicNumberLength);
+        }
+
+        if (magicNumberLength > 0) {
+            if (magicNumberOffset > maxFrameLength - magicNumberLength) {
+                throw new IllegalArgumentException(
+                        "maxFrameLength (" + maxFrameLength + ") " +
+                        "must be equal to or greater than " +
+                        "magicNumberOffset (" + magicNumberOffset + ") + " +
+                        "magicNumberLength (" + magicNumberLength + ").");
+            }
+            if (magicNumberLength < 8 && (magicNumber < 0 || magicNumber >= 1L << (magicNumberLength * 8))) {
+                throw new IllegalArgumentException(
+                        "magicNumber (" + magicNumber + ") does not fit into " +
+                        magicNumberLength + " bytes.");
+            }
+        }
+
         this.maxFrameLength = maxFrameLength;
         this.lengthFieldOffset = lengthFieldOffset;
         this.lengthFieldLength = lengthFieldLength;
@@ -326,6 +501,18 @@ public class LengthFieldBasedFrameDecoder extends ByteToMessageDecoder {
         this.lengthFieldEndOffset = lengthFieldOffset + lengthFieldLength;
         this.initialBytesToStrip = initialBytesToStrip;
         this.failFast = failFast;
+        this.magicNumber = magicNumber;
+        this.magicNumberOffset = magicNumberOffset;
+        this.magicNumberLength = magicNumberLength;
+        this.magicNumberEndOffset = magicNumberOffset + magicNumberLength;
+        this.maxResyncScanBytes = maxResyncScanBytes;
+        if (magicNumberLength > 0) {
+            // The first byte of the magic number in wire order, used to pre-filter scan positions.
+            int shift = byteOrder == ByteOrder.BIG_ENDIAN ? (magicNumberLength - 1) * 8 : 0;
+            this.magicNumberFirstByte = (byte) (magicNumber >>> shift);
+        } else {
+            this.magicNumberFirstByte = 0;
+        }
     }
 
     @Override
@@ -395,6 +582,9 @@ public class LengthFieldBasedFrameDecoder extends ByteToMessageDecoder {
      *                          be created.
      */
     protected Object decode(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
+        if (magicNumberLength > 0) {
+            return decodeWithMagicNumberValidation(ctx, in);
+        }
         long frameLength = 0;
         if (frameLengthInt == -1) { // new frame
 
@@ -426,12 +616,16 @@ public class LengthFieldBasedFrameDecoder extends ByteToMessageDecoder {
             // never overflows because it's less than maxFrameLength
             frameLengthInt = (int) frameLength;
         }
+        return readFrame(ctx, in);
+    }
+
+    private Object readFrame(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
         if (in.readableBytes() < frameLengthInt) { // frameLengthInt exist , just check buf
             return null;
         }
         if (initialBytesToStrip > frameLengthInt) {
             // Reset the state before failing so the next frame is decoded again. Use frameLengthInt, as frameLength
-            // is 0 if the length field was decoded by a previous call.
+            // is not available if the length field was decoded by a previous call.
             int frameLengthToSkip = frameLengthInt;
             frameLengthInt = -1;
             failOnFrameLengthLessThanInitialBytesToStrip(in, frameLengthToSkip, initialBytesToStrip);
@@ -445,6 +639,212 @@ public class LengthFieldBasedFrameDecoder extends ByteToMessageDecoder {
         in.readerIndex(readerIndex + actualFrameLength);
         frameLengthInt = -1; // start processing the next frame
         return frame;
+    }
+
+    /**
+     * Decodes a frame when magic number validation is enabled.  The magic number is
+     * checked before the length field is consulted; on a mismatch the decoder either
+     * fails (resynchronization disabled) or scans forward for the next plausible magic
+     * number (resynchronization enabled).  See the class javadoc for the exact rules,
+     * including how {@code failFast} is honored.
+     */
+    private Object decodeWithMagicNumberValidation(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
+        if (frameLengthInt == -1) { // new frame
+
+            if (discardingTooLongFrame) {
+                discardingTooLongFrame(in);
+            }
+
+            int headerEndOffset = Math.max(lengthFieldEndOffset, magicNumberEndOffset);
+            while (frameLengthInt == -1) {
+                if (in.readableBytes() < headerEndOffset) {
+                    // Not even a complete header (e.g. half a frame was received):
+                    // wait for more data, never scan or fail on a partial header.
+                    return null;
+                }
+
+                if (!resyncing && !matchesMagicNumber(in, in.readerIndex())) {
+                    if (!isResyncEnabled()) {
+                        throw new CorruptedFrameException(
+                                "magic number mismatch at offset " + magicNumberOffset +
+                                ": expected " + magicNumber);
+                    }
+                    startResync();
+                }
+
+                if (resyncing) {
+                    if (!tryResync(in)) {
+                        return null;
+                    }
+                    // The reader index now points at a validated candidate, re-check the header.
+                    continue;
+                }
+
+                long frameLength = getUnadjustedFrameLength(in, in.readerIndex() + lengthFieldOffset,
+                        lengthFieldLength, byteOrder);
+
+                if (frameLength < 0) {
+                    if (isResyncEnabled() && !failFast) {
+                        // False-positive magic number match: resynchronize instead of failing.
+                        startResync();
+                        continue;
+                    }
+                    failOnNegativeLengthField(in, frameLength, lengthFieldEndOffset);
+                }
+
+                frameLength += lengthAdjustment + lengthFieldEndOffset;
+
+                if (frameLength < lengthFieldEndOffset) {
+                    if (isResyncEnabled() && !failFast) {
+                        startResync();
+                        continue;
+                    }
+                    failOnFrameLengthLessThanLengthFieldEndOffset(in, frameLength, lengthFieldEndOffset);
+                }
+
+                if (frameLength > maxFrameLength) {
+                    if (isResyncEnabled() && !failFast) {
+                        startResync();
+                        continue;
+                    }
+                    exceededFrameLength(in, frameLength);
+                    return null;
+                }
+                // never overflows because it's less than maxFrameLength
+                frameLengthInt = (int) frameLength;
+            }
+        }
+        return readFrame(ctx, in);
+    }
+
+    private boolean isResyncEnabled() {
+        return maxResyncScanBytes > 0;
+    }
+
+    private void startResync() {
+        resyncing = true;
+        resyncScannedBytes = 0;
+    }
+
+    /**
+     * Scans forward for the next magic number whose length field is self-consistent.
+     * The scanned bytes are consumed from the buffer, so the scan position is implicitly
+     * maintained across {@code decode} invocations and stays correct when the cumulative
+     * buffer is compacted (see {@link ByteToMessageDecoder#discardSomeReadBytes()}).
+     *
+     * @return {@code true} if the reader index now points at a validated candidate,
+     *         {@code false} if more data is needed
+     * @throws CorruptedFrameException if no plausible magic number was found within
+     *         {@code maxResyncScanBytes} bytes
+     */
+    private boolean tryResync(ByteBuf in) {
+        for (;;) {
+            int candidate = indexOfMagicNumber(in);
+            if (candidate < 0) {
+                // No magic number in the readable bytes. Consume everything but the tail
+                // that may hold a partially received magic number.
+                int consumed = in.readableBytes() - (magicNumberLength - 1);
+                if (consumed > 0) {
+                    in.skipBytes(consumed);
+                    resyncScannedBytes += consumed;
+                    checkResyncScanWindow();
+                }
+                return false;
+            }
+            int skipped = candidate - in.readerIndex();
+            if (skipped > 0) {
+                in.skipBytes(skipped);
+                resyncScannedBytes += skipped;
+                checkResyncScanWindow();
+            }
+            if (in.readableBytes() < lengthFieldEndOffset) {
+                // Candidate found but the length field was not fully received yet: wait for more data.
+                return false;
+            }
+            if (isLengthFieldPlausible(in)) {
+                resyncing = false;
+                resyncScannedBytes = 0;
+                return true;
+            }
+            // False positive (e.g. magic number bytes inside a length field or a payload):
+            // skip one byte and keep scanning.
+            in.skipBytes(1);
+            resyncScannedBytes++;
+            checkResyncScanWindow();
+        }
+    }
+
+    private void checkResyncScanWindow() {
+        if (resyncScannedBytes > maxResyncScanBytes) {
+            resyncing = false;
+            resyncScannedBytes = 0;
+            throw new CorruptedFrameException(
+                    "unable to resynchronize: no plausible magic number found within " +
+                    maxResyncScanBytes + " bytes");
+        }
+    }
+
+    /**
+     * Returns {@code true} if the length field at the current reader index decodes to a
+     * frame length that is consistent with the decoder configuration.  Used to suppress
+     * false-positive magic number matches while resynchronizing.
+     */
+    private boolean isLengthFieldPlausible(ByteBuf in) {
+        long frameLength = getUnadjustedFrameLength(in, in.readerIndex() + lengthFieldOffset,
+                lengthFieldLength, byteOrder);
+        if (frameLength < 0) {
+            return false;
+        }
+        frameLength += lengthAdjustment + lengthFieldEndOffset;
+        return frameLength >= lengthFieldEndOffset &&
+                frameLength >= initialBytesToStrip &&
+                frameLength <= maxFrameLength;
+    }
+
+    private boolean matchesMagicNumber(ByteBuf in, int offset) {
+        ByteBuf buf = in.order(byteOrder);
+        long actual;
+        switch (magicNumberLength) {
+        case 1:
+            actual = buf.getUnsignedByte(offset);
+            break;
+        case 2:
+            actual = buf.getUnsignedShort(offset);
+            break;
+        case 3:
+            actual = buf.getUnsignedMedium(offset);
+            break;
+        case 4:
+            actual = buf.getUnsignedInt(offset);
+            break;
+        case 8:
+            actual = buf.getLong(offset);
+            break;
+        default:
+            throw new DecoderException(
+                    "unsupported magicNumberLength: " + magicNumberLength + " (expected: 1, 2, 3, 4, or 8)");
+        }
+        return actual == magicNumber;
+    }
+
+    /**
+     * Returns the index of the next magic number occurrence at or after the reader index,
+     * or {@code -1} if there is none in the readable bytes.
+     */
+    private int indexOfMagicNumber(ByteBuf in) {
+        int index = in.readerIndex();
+        int end = in.writerIndex() - magicNumberLength + 1;
+        while (index < end) {
+            index = in.indexOf(index, end, magicNumberFirstByte);
+            if (index < 0) {
+                return -1;
+            }
+            if (matchesMagicNumber(in, index)) {
+                return index;
+            }
+            index++;
+        }
+        return -1;
     }
 
     /**
