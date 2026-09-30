@@ -28,10 +28,16 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.Queue;
 import java.util.Set;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -91,6 +97,11 @@ public class HashedWheelTimer implements Timer {
     private static final AtomicBoolean WARNED_TOO_MANY_INSTANCES = new AtomicBoolean();
     private static final int INSTANCE_COUNT_LIMIT = 64;
     private static final long MILLISECOND_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
+    /**
+     * Upper bound on the number of threads the internal executor may use when the optional task
+     * isolation mode is enabled.
+     */
+    private static final int MAX_ISOLATION_THREADS = 8;
     private static final ResourceLeakDetector<HashedWheelTimer> leakDetector = ResourceLeakDetectorFactory.instance()
             .newResourceLeakDetector(HashedWheelTimer.class, 1);
 
@@ -116,6 +127,11 @@ public class HashedWheelTimer implements Timer {
     private final AtomicLong pendingTimeouts = new AtomicLong(0);
     private final long maxPendingTimeouts;
     private final Executor taskExecutor;
+    private final boolean taskIsolationEnabled;
+    private final ExecutorService isolatedTaskExecutor;
+    // Tasks which were dispatched to the isolated executor but did not start running yet.
+    // Only used when {@link #taskIsolationEnabled} is {@code true}.
+    final Queue<HashedWheelTimeout> dispatchedTimeouts = new ConcurrentLinkedQueue<HashedWheelTimeout>();
 
     private volatile long startTime;
 
@@ -278,12 +294,49 @@ public class HashedWheelTimer implements Timer {
             ThreadFactory threadFactory,
             long tickDuration, TimeUnit unit, int ticksPerWheel, boolean leakDetection,
             long maxPendingTimeouts, Executor taskExecutor) {
+        this(threadFactory, tickDuration, unit, ticksPerWheel, leakDetection,
+                maxPendingTimeouts, taskExecutor, false);
+    }
+
+    /**
+     * Creates a new timer.
+     *
+     * @param threadFactory        a {@link ThreadFactory} that creates a
+     *                             background {@link Thread} which is dedicated to
+     *                             {@link TimerTask} execution.
+     * @param tickDuration         the duration between tick
+     * @param unit                 the time unit of the {@code tickDuration}
+     * @param ticksPerWheel        the size of the wheel
+     * @param leakDetection        {@code true} if leak detection should be enabled always,
+     *                             if false it will only be enabled if the worker thread is not
+     *                             a daemon thread.
+     * @param maxPendingTimeouts   The maximum number of pending timeouts after which call to
+     *                             {@code newTimeout} will result in
+     *                             {@link java.util.concurrent.RejectedExecutionException}
+     *                             being thrown. No maximum pending timeouts limit is assumed if
+     *                             this value is 0 or negative.
+     * @param taskExecutor         The {@link Executor} that is used to execute the submitted {@link TimerTask}s.
+     *                             The caller is responsible to shutdown the {@link Executor} once it is not needed
+     *                             anymore.
+     * @param taskIsolationEnabled if {@code true}, expired {@link TimerTask}s are executed on an internal,
+     *                             fixed-capacity pool of worker threads instead of the timer's worker thread,
+     *                             so that a long running task cannot block the expiration of later ticks.
+     *                             See {@code ISOLATION.md} in the module for the exact ordering, timing,
+     *                             cancellation and shutdown semantics. When {@code true}, the timer always
+     *                             uses its internal executor and the given {@code taskExecutor} is ignored.
+     * @throws NullPointerException     if either of {@code threadFactory} and {@code unit} is {@code null}
+     * @throws IllegalArgumentException if either of {@code tickDuration} and {@code ticksPerWheel} is &lt;= 0
+     */
+    public HashedWheelTimer(
+            ThreadFactory threadFactory,
+            long tickDuration, TimeUnit unit, int ticksPerWheel, boolean leakDetection,
+            long maxPendingTimeouts, Executor taskExecutor, boolean taskIsolationEnabled) {
 
         checkNotNull(threadFactory, "threadFactory");
         checkNotNull(unit, "unit");
         checkPositive(tickDuration, "tickDuration");
         checkPositive(ticksPerWheel, "ticksPerWheel");
-        this.taskExecutor = checkNotNull(taskExecutor, "taskExecutor");
+        checkNotNull(taskExecutor, "taskExecutor");
 
         // Normalize ticksPerWheel to power of two and initialize the wheel.
         wheel = createWheel(ticksPerWheel);
@@ -308,6 +361,24 @@ public class HashedWheelTimer implements Timer {
         }
 
         workerThread = threadFactory.newThread(worker);
+
+        this.taskIsolationEnabled = taskIsolationEnabled;
+        if (taskIsolationEnabled) {
+            // A bounded pool with an effectively unbounded queue: a burst of expirations is queued in
+            // submission order while at most MAX_ISOLATION_THREADS tasks run concurrently. Threads are
+            // created lazily and core threads may time out, so nothing is pinned while idle.
+            ThreadPoolExecutor pool = new ThreadPoolExecutor(
+                    MAX_ISOLATION_THREADS, MAX_ISOLATION_THREADS,
+                    60L, TimeUnit.SECONDS,
+                    new LinkedBlockingQueue<Runnable>(),
+                    new IsolatedTaskThreadFactory(threadFactory));
+            pool.allowCoreThreadTimeOut(true);
+            isolatedTaskExecutor = pool;
+            this.taskExecutor = isolatedTaskExecutor;
+        } else {
+            isolatedTaskExecutor = null;
+            this.taskExecutor = taskExecutor;
+        }
 
         leak = leakDetection || !workerThread.isDaemon() ? leakDetector.track(this) : null;
 
@@ -418,11 +489,67 @@ public class HashedWheelTimer implements Timer {
                 assert closed;
             }
         }
+        if (!taskIsolationEnabled) {
+            Set<Timeout> unprocessed = worker.unprocessedTimeouts();
+            Set<Timeout> cancelled = new HashSet<Timeout>(unprocessed.size());
+            for (Timeout timeout : unprocessed) {
+                if (timeout.cancel()) {
+                    cancelled.add(timeout);
+                }
+            }
+            return cancelled;
+        }
+        return stopIsolated();
+    }
+
+    /**
+     * Shutdown path of the task isolation mode. Only tasks which have not started running yet are
+     * cancelled and returned: tasks still waiting in the internal executor queue as well as tasks
+     * that were dispatched but did not claim execution yet. Tasks which are currently running are
+     * interrupted (best effort) and left alone; {@code stop()} never waits for them.
+     */
+    private Set<Timeout> stopIsolated() {
         Set<Timeout> unprocessed = worker.unprocessedTimeouts();
         Set<Timeout> cancelled = new HashSet<Timeout>(unprocessed.size());
         for (Timeout timeout : unprocessed) {
             if (timeout.cancel()) {
                 cancelled.add(timeout);
+            }
+        }
+
+        // Drain everything the internal executor had not started yet. shutdownNow() interrupts the
+        // tasks that are already running (consistent with the inline path where stop() interrupts
+        // the worker thread) and hands back the still queued runnables.
+        List<Runnable> queued = isolatedTaskExecutor.shutdownNow();
+        for (Runnable runnable : queued) {
+            HashedWheelTimeout timeout = ((IsolatedTask) runnable).timeout;
+            if (timeout.markCancelledAfterShutdown()) {
+                cancelled.add(timeout);
+                timeout.invokeCancelled();
+            }
+        }
+
+        // Tasks dispatched after the queue was drained above either still sit in dispatchedTimeouts
+        // (claim has not happened yet) and must be cancelled, or already won the claim race and are
+        // running. Snapshotting the concurrently changing queue is safe because each timeout only
+        // leaves this queue through a successful claim.
+        // The worker thread is dead at this point so no new tasks can be dispatched; the loop only
+        // has to absorb tasks handed to the executor concurrently with shutdownNow(). Termination
+        // is polled (never awaited) so that tasks which are stuck cannot stall stop().
+        for (int i = 0; i < 3 && !isolatedTaskExecutor.isTerminated(); i++) {
+            for (HashedWheelTimeout timeout : dispatchedTimeouts) {
+                if (timeout.markCancelledAfterShutdown()) {
+                    cancelled.add(timeout);
+                    timeout.invokeCancelled();
+                }
+            }
+            if (!isolatedTaskExecutor.isTerminated()) {
+                try {
+                    Thread.sleep(10);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             }
         }
         return cancelled;
@@ -476,6 +603,9 @@ public class HashedWheelTimer implements Timer {
     private final class Worker implements Runnable {
         private final Set<Timeout> unprocessedTimeouts = new HashSet<Timeout>();
 
+        // Reused across ticks, allocated lazily and only in the task isolation mode.
+        private List<HashedWheelTimeout> expiredTimeouts;
+
         private long tick;
 
         @Override
@@ -498,7 +628,15 @@ public class HashedWheelTimer implements Timer {
                     HashedWheelBucket bucket =
                             wheel[idx];
                     transferTimeoutsToBuckets();
-                    bucket.expireTimeouts(deadline);
+                    if (taskIsolationEnabled) {
+                        if (expiredTimeouts == null) {
+                            expiredTimeouts = new ArrayList<HashedWheelTimeout>();
+                        }
+                        bucket.expireTimeouts(deadline, expiredTimeouts);
+                        dispatchExpiredTimeouts();
+                    } else {
+                        bucket.expireTimeouts(deadline);
+                    }
                     tick++;
                 }
             } while (WORKER_STATE_UPDATER.get(HashedWheelTimer.this) == WORKER_STATE_STARTED);
@@ -517,6 +655,17 @@ public class HashedWheelTimer implements Timer {
                 }
             }
             processCancelledTasks();
+        }
+
+        private void dispatchExpiredTimeouts() {
+            // Dispatch in bucket (submission) order. Submission happens-before expiration
+            // processing, so pool threads observe the tasks in the same order; whether two
+            // same-deadline tasks actually start in that order is not guaranteed (see
+            // ISOLATION.md).
+            for (int i = 0; i < expiredTimeouts.size(); i++) {
+                taskExecutor.execute(new IsolatedTask(expiredTimeouts.get(i)));
+            }
+            expiredTimeouts.clear();
         }
 
         private void transferTimeoutsToBuckets() {
@@ -614,6 +763,8 @@ public class HashedWheelTimer implements Timer {
         private static final int ST_INIT = 0;
         private static final int ST_CANCELLED = 1;
         private static final int ST_EXPIRED = 2;
+        // Only used in the task isolation mode: the task is executing on an isolated thread.
+        private static final int ST_RUNNING = 3;
         private static final AtomicIntegerFieldUpdater<HashedWheelTimeout> STATE_UPDATER =
                 AtomicIntegerFieldUpdater.newUpdater(HashedWheelTimeout.class, "state");
 
@@ -654,6 +805,18 @@ public class HashedWheelTimer implements Timer {
 
         @Override
         public boolean cancel() {
+            if (timer.taskIsolationEnabled) {
+                // Already dispatched to the isolated executor (or queued in it)? Then the timeout
+                // is no longer reachable from the wheel; cancel it directly instead of enqueuing
+                // it for the worker thread.
+                if (state() == ST_EXPIRED) {
+                    if (cancelDispatched()) {
+                        invokeCancelled();
+                        return true;
+                    }
+                    return false;
+                }
+            }
             // only update the state it will be removed from HashedWheelBucket on next tick.
             if (!compareAndSetState(ST_INIT, ST_CANCELLED)) {
                 return false;
@@ -692,7 +855,8 @@ public class HashedWheelTimer implements Timer {
 
         @Override
         public boolean isExpired() {
-            return state() == ST_EXPIRED;
+            int state = state();
+            return state == ST_EXPIRED || state == ST_RUNNING;
         }
 
         public void expire() {
@@ -711,8 +875,62 @@ public class HashedWheelTimer implements Timer {
             }
         }
 
+        /**
+         * Expiration in the task isolation mode. The state is flipped to {@link #ST_EXPIRED}, the
+         * timeout is unlinked from the bucket and the pending count is decremented (exactly like
+         * the inline path); the task itself is only collected here and handed to the internal
+         * executor afterwards. Because expiration and execution happen on different threads, a
+         * timeout cancelled between dispatch and the actual start is filtered out by {@link #run()}.
+         */
+        void expireIsolated() {
+            if (!compareAndSetState(ST_INIT, ST_EXPIRED)) {
+                return;
+            }
+            remove();
+        }
+
+        /**
+         * Cancel a timeout that was already dispatched to the isolated executor but has not run
+         * yet. Returns {@code false} if the timeout already started running or was cancelled.
+         */
+        boolean cancelDispatched() {
+            if (!compareAndSetState(ST_EXPIRED, ST_CANCELLED)) {
+                return false;
+            }
+            timer.dispatchedTimeouts.remove(this);
+            return true;
+        }
+
+        /**
+         * Cancellation applied during {@link #stop()} while shutting down the isolated executor.
+         * Covers both still-queued and dispatched-but-not-running timeouts.
+         */
+        boolean markCancelledAfterShutdown() {
+            return compareAndSetState(ST_EXPIRED, ST_CANCELLED);
+        }
+
+        void invokeCancelled() {
+            try {
+                task.cancelled(this);
+            } catch (Throwable t) {
+                if (logger.isWarnEnabled()) {
+                    logger.warn("An exception was thrown by " + TimerTask.class.getSimpleName()
+                            + ".cancelled().", t);
+                }
+            }
+        }
+
         @Override
         public void run() {
+            if (timer.taskIsolationEnabled) {
+                // The task was dispatched earlier; it must only run if it was not cancelled in
+                // the meantime and if stop() did not cancel it while draining the executor.
+                if (!compareAndSetState(ST_EXPIRED, ST_RUNNING)) {
+                    timer.dispatchedTimeouts.remove(this);
+                    return;
+                }
+                timer.dispatchedTimeouts.remove(this);
+            }
             try {
                 task.run(this);
             } catch (Throwable t) {
@@ -801,6 +1019,35 @@ public class HashedWheelTimer implements Timer {
             }
         }
 
+        /**
+         * Expire all {@link HashedWheelTimeout}s for the given {@code deadline} in the task
+         * isolation mode and collect them in the supplied list so the worker can dispatch them in
+         * one ordered batch.
+         */
+        public void expireTimeouts(long deadline, List<HashedWheelTimeout> expired) {
+            HashedWheelTimeout timeout = head;
+
+            // process all timeouts
+            while (timeout != null) {
+                HashedWheelTimeout next = timeout.next;
+                if (timeout.remainingRounds <= 0) {
+                    if (timeout.deadline <= deadline) {
+                        timeout.expireIsolated();
+                        if (timeout.state() == HashedWheelTimeout.ST_EXPIRED) {
+                            expired.add(timeout);
+                        }
+                    } else {
+                        // The timeout was placed into a wrong slot. This should never happen.
+                        throw new IllegalStateException(String.format(
+                                "timeout.deadline (%d) > deadline (%d)", timeout.deadline, deadline));
+                    }
+                } else if (!timeout.isCancelled()) {
+                    timeout.remainingRounds --;
+                }
+                timeout = next;
+            }
+        }
+
         public HashedWheelTimeout remove(HashedWheelTimeout timeout) {
             HashedWheelTimeout prev = timeout.prev;
             HashedWheelTimeout next = timeout.next;
@@ -860,6 +1107,45 @@ public class HashedWheelTimer implements Timer {
             head.prev = null;
             head.bucket = null;
             return head;
+        }
+    }
+
+    /**
+     * Wrapper handed to the internal executor in the task isolation mode. Registering the timeout
+     * in {@link #dispatchedTimeouts} on construction (which happens on the worker thread) is what
+     * lets {@link #stop()} distinguish "not started yet" from "already running".
+     */
+    private static final class IsolatedTask implements Runnable {
+        final HashedWheelTimeout timeout;
+
+        IsolatedTask(HashedWheelTimeout timeout) {
+            this.timeout = timeout;
+            timeout.timer.dispatchedTimeouts.add(timeout);
+        }
+
+        @Override
+        public void run() {
+            timeout.run();
+        }
+    }
+
+    /**
+     * {@link ThreadFactory} for the internal executor of the task isolation mode. Delegates thread
+     * creation to the user supplied factory and only tags the thread name so the extra threads can
+     * be told apart from the timer's worker thread.
+     */
+    private static final class IsolatedTaskThreadFactory implements ThreadFactory {
+        private final ThreadFactory delegate;
+
+        IsolatedTaskThreadFactory(ThreadFactory delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public Thread newThread(Runnable r) {
+            Thread thread = delegate.newThread(r);
+            thread.setName(thread.getName() + "-isolatedTimeout");
+            return thread;
         }
     }
 }
